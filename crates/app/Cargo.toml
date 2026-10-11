@@ -1,0 +1,11 @@
+[package]
+name = "app"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sim = { path = "../sim" }
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+leptos = { version = "0.8", features = ["csr"] }
+web-sys = { version = "0.3", features = ["Storage"] }
