@@ -9,3 +9,9 @@ button {
   font: inherit;
   padding: 0.4rem 0.8rem;
 }
+
+.pyramid {
+  display: block;
+  width: 100%;
+  height: 15rem;
+}

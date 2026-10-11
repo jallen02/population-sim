@@ -1,46 +1,49 @@
 //! Pure game simulation: no I/O, no browser APIs, deterministic.
 //!
-//! Front ends (the Leptos app, the CLI) drive it three ways:
+//! Front ends (the Leptos app, the CLI) drive it two ways:
 //! - `advance(elapsed_ms)` turns wall-clock time into whole fixed-length ticks.
-//! - `apply(command)` performs a player action.
 //! - `snapshot()` returns what to render.
 //!
 //! `save()` / `load()` round-trip the full state as JSON.
+
+mod food;
+mod population;
+
+pub use food::{FOOD_PER_PERSON, FOOD_STORAGE, Food};
+pub use population::{Population, Rate, RateRule, STARVATION_DEATH_RATE};
 
 use serde::{Deserialize, Serialize};
 
 /// Length of one simulation tick.
 pub const TICK_MS: f64 = 100.0;
+/// Ticks per in-game year. With 100 ms ticks, one year passes per second.
+/// Food is produced every tick; eating, births, deaths and aging happen when a year ends.
+pub const TICKS_PER_YEAR: u64 = 10;
+/// Food produced per year. Fixed for now; later it will come from people working at buildings.
+pub const BASE_FOOD_PRODUCTION: f64 = 1000.0;
 
 /// Everything that persists in a save. Replace the example fields with your game's state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
     pub tick: u64,
-    pub points: f64,
-    pub generators: u32,
-}
-
-/// A player action. Front ends send these as JSON, e.g. `{"type":"Click"}`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum Command {
-    Click,
-    BuyGenerator,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum CommandError {
-    CannotAfford { cost: f64 },
+    #[serde(default)]
+    pub population: Population,
+    #[serde(default)]
+    pub food: Food,
 }
 
 /// What the front end renders. Keep it flat and derived from `State`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub tick: u64,
-    pub points: f64,
-    pub points_per_sec: f64,
-    pub generators: u32,
-    pub generator_cost: f64,
+    pub population: u64,
+    pub food: f64,
+    /// Food produced per year, spread evenly across its ticks.
+    pub food_production: f64,
+    /// Food the current population eats per year.
+    pub food_consumption: f64,
+    /// Head counts indexed by age in years.
+    pub ages: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,7 +59,10 @@ impl Game {
     }
 
     pub fn load(json: &str) -> serde_json::Result<Self> {
-        Ok(Self { state: serde_json::from_str(json)?, accumulator_ms: 0.0 })
+        Ok(Self {
+            state: serde_json::from_str(json)?,
+            accumulator_ms: 0.0,
+        })
     }
 
     pub fn save(&self) -> String {
@@ -77,41 +83,33 @@ impl Game {
 
     /// One fixed step of game rules.
     pub fn tick(&mut self) {
-        self.state.points += self.points_per_sec() * TICK_MS / 1000.0;
+        let production = self.food_production() / TICKS_PER_YEAR as f64;
+        self.state.food.produce(production);
         self.state.tick += 1;
+        if self.state.tick.is_multiple_of(TICKS_PER_YEAR) {
+            self.end_year();
+        }
     }
 
-    pub fn apply(&mut self, command: Command) -> Result<(), CommandError> {
-        match command {
-            Command::Click => self.state.points += 1.0,
-            Command::BuyGenerator => {
-                let cost = self.generator_cost();
-                if self.state.points < cost {
-                    return Err(CommandError::CannotAfford { cost });
-                }
-                self.state.points -= cost;
-                self.state.generators += 1;
-            }
-        }
-        Ok(())
+    /// Feeds the population from the stored food, then applies births, deaths and aging.
+    fn end_year(&mut self) {
+        let fed = self.state.food.end_year(self.state.population.total());
+        self.state.population.end_year(fed);
+    }
+
+    fn food_production(&self) -> f64 {
+        BASE_FOOD_PRODUCTION
     }
 
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             tick: self.state.tick,
-            points: self.state.points,
-            points_per_sec: self.points_per_sec(),
-            generators: self.state.generators,
-            generator_cost: self.generator_cost(),
+            population: self.state.population.total(),
+            food: self.state.food.stock(),
+            food_production: self.food_production(),
+            food_consumption: self.state.population.total() as f64 * FOOD_PER_PERSON,
+            ages: self.state.population.counts().collect(),
         }
-    }
-
-    fn points_per_sec(&self) -> f64 {
-        self.state.generators as f64
-    }
-
-    fn generator_cost(&self) -> f64 {
-        10.0 * 1.15f64.powi(self.state.generators as i32)
     }
 }
 
@@ -128,31 +126,45 @@ mod tests {
     }
 
     #[test]
-    fn generators_produce_over_time() {
+    fn nothing_changes_until_the_year_ends() {
         let mut game = Game::new();
-        game.state.points = 10.0;
-        game.apply(Command::BuyGenerator).unwrap();
-        game.advance(1000.0);
-        assert!((game.state.points - 1.0).abs() < 1e-9);
+        let start = game.snapshot();
+        for _ in 0..TICKS_PER_YEAR - 1 {
+            game.tick();
+        }
+        assert_eq!(game.snapshot().ages, start.ages);
+        game.tick();
+        assert_ne!(game.snapshot().ages, start.ages);
     }
 
     #[test]
-    fn cannot_buy_without_points() {
+    fn food_grows_every_tick() {
         let mut game = Game::new();
-        assert!(matches!(game.apply(Command::BuyGenerator), Err(CommandError::CannotAfford { .. })));
+        game.tick();
+        let per_tick = BASE_FOOD_PRODUCTION / TICKS_PER_YEAR as f64;
+        assert_eq!(game.snapshot().food, per_tick);
+        game.tick();
+        assert_eq!(game.snapshot().food, per_tick * 2.0);
     }
 
     #[test]
-    fn save_round_trips() {
+    fn food_caps_the_population() {
         let mut game = Game::new();
-        game.apply(Command::Click).unwrap();
+        for _ in 0..500 * TICKS_PER_YEAR {
+            game.tick();
+        }
+        let cap = (BASE_FOOD_PRODUCTION + FOOD_STORAGE) / FOOD_PER_PERSON;
+        assert!(game.snapshot().population as f64 <= cap * 1.1);
+    }
+
+    #[test]
+    fn population_round_trips_and_loads_old_saves() {
+        let mut game = Game::new();
+        game.advance(TICK_MS * TICKS_PER_YEAR as f64 * 5.0);
         let loaded = Game::load(&game.save()).unwrap();
-        assert_eq!(loaded.state.points, 1.0);
-    }
+        assert_eq!(loaded.snapshot().population, game.snapshot().population);
 
-    #[test]
-    fn commands_parse_from_json() {
-        let command: Command = serde_json::from_str(r#"{"type":"BuyGenerator"}"#).unwrap();
-        assert!(matches!(command, Command::BuyGenerator));
+        let old = Game::load(r#"{"tick":0,"points":0.0,"generators":0}"#).unwrap();
+        assert_eq!(old.snapshot().population, Game::new().snapshot().population);
     }
 }
